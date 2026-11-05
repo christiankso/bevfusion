@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from mmdet3d.models.builder import build_backbone
 from mmdet.models import BACKBONES
 from torchvision.utils import save_image
-from mmdet3d.ops import feature_decorator
+# from mmdet3d.ops import feature_decorator
 from mmcv.cnn.bricks.non_local import NonLocal2d
 
 from flash_attn.flash_attention import FlashMHA

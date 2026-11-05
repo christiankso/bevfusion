@@ -34,6 +34,8 @@ class DepthLSSTransform(BaseDepthTransform):
             ybound=ybound,
             zbound=zbound,
             dbound=dbound,
+            height_expand=False,
+            add_depth_features=False,
         )
         self.dtransform = nn.Sequential(
             nn.Conv2d(1, 8, 1),
