@@ -1,6 +1,8 @@
 import argparse
 import copy
+import json
 import os
+import time
 import warnings
 
 import mmcv
@@ -74,6 +76,18 @@ def parse_args():
         "is allowed.",
     )
     parser.add_argument(
+        "--degrade",
+        nargs="+",
+        action=DictAction,
+        help="sensor degradation for robustness tests, e.g. point_drop=0.5 "
+        "max_range=30 brightness=0.3 blur=5 drop_cams=[CAM_FRONT] "
+        "reduce_beams=16 sweeps_num=0. See SensorDegradation.",
+    )
+    parser.add_argument(
+        "--metrics-out",
+        help="write evaluation metrics and timing to this json file",
+    )
+    parser.add_argument(
         "--options",
         nargs="+",
         action=DictAction,
@@ -110,6 +124,24 @@ def parse_args():
     return args
 
 
+def apply_degradation(pipeline, degrade):
+    """Set loader options and insert SensorDegradation before ImageAug3D."""
+    degrade = dict(degrade)
+    reduce_beams = degrade.pop("reduce_beams", None)
+    sweeps_num = degrade.pop("sweeps_num", None)
+    for step in pipeline:
+        if reduce_beams is not None and step["type"] in (
+            "LoadPointsFromFile",
+            "LoadPointsFromMultiSweeps",
+        ):
+            step["reduce_beams"] = reduce_beams
+        if sweeps_num is not None and step["type"] == "LoadPointsFromMultiSweeps":
+            step["sweeps_num"] = sweeps_num
+    if degrade:
+        index = next(i for i, s in enumerate(pipeline) if s["type"] == "ImageAug3D")
+        pipeline.insert(index, dict(type="SensorDegradation", **degrade))
+
+
 def main():
     args = parse_args()
     dist.init()
@@ -135,6 +167,9 @@ def main():
 
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    if args.degrade:
+        apply_degradation(cfg.data.test.pipeline, args.degrade)
+        print("Degraded test pipeline:", [s["type"] for s in cfg.data.test.pipeline])
     # set cudnn_benchmark
     if cfg.get("cudnn_benchmark", False):
         torch.backends.cudnn.benchmark = True
@@ -200,7 +235,9 @@ def main():
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
         )
+        start = time.time()
         outputs = multi_gpu_test(model, data_loader, args.tmpdir, args.gpu_collect)
+        wall_time = time.time() - start
 
     rank, _ = get_dist_info()
     if rank == 0:
@@ -223,7 +260,23 @@ def main():
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
-            print(dataset.evaluate(outputs, **eval_kwargs))
+            metrics = dataset.evaluate(outputs, **eval_kwargs)
+            print(metrics)
+            if args.metrics_out:
+                mmcv.mkdir_or_exist(os.path.dirname(args.metrics_out) or ".")
+                with open(args.metrics_out, "w") as f:
+                    json.dump(
+                        dict(
+                            config=args.config,
+                            checkpoint=args.checkpoint,
+                            degrade=args.degrade or {},
+                            num_frames=len(dataset),
+                            wall_time_s=wall_time,
+                            metrics=metrics,
+                        ),
+                        f,
+                        indent=2,
+                    )
 
 
 if __name__ == "__main__":
