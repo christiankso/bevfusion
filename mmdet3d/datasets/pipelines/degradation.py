@@ -22,6 +22,7 @@ class SensorDegradation:
         point_drop (float): Fraction of LiDAR points removed at random.
         max_range (float): Remove points farther than this (m, in the xy plane).
         brightness (float): Image brightness factor; 1.0 = unchanged, 0.0 = black.
+        contrast (float): Image contrast factor; 1.0 = unchanged, 0.0 = flat gray.
         blur (float): Gaussian blur radius in pixels on the original image.
         drop_cams (list[str]): Cameras replaced by black frames, e.g. ["CAM_FRONT"].
         seed (int): Base random seed.
@@ -32,6 +33,7 @@ class SensorDegradation:
         point_drop=0.0,
         max_range=None,
         brightness=1.0,
+        contrast=1.0,
         blur=0.0,
         drop_cams=(),
         seed=0,
@@ -40,6 +42,7 @@ class SensorDegradation:
         self.point_drop = point_drop
         self.max_range = max_range
         self.brightness = brightness
+        self.contrast = contrast
         self.blur = blur
         self.drop_cams = list(drop_cams)
         self.seed = seed
@@ -69,6 +72,8 @@ class SensorDegradation:
             else:
                 if self.brightness != 1.0:
                     img = ImageEnhance.Brightness(img).enhance(self.brightness)
+                if self.contrast != 1.0:
+                    img = ImageEnhance.Contrast(img).enhance(self.contrast)
                 if self.blur > 0:
                     img = img.filter(ImageFilter.GaussianBlur(self.blur))
             images.append(img)
@@ -77,7 +82,12 @@ class SensorDegradation:
     def __call__(self, results):
         if self.point_drop > 0 or self.max_range is not None:
             self._degrade_points(results)
-        if self.brightness != 1.0 or self.blur > 0 or self.drop_cams:
+        if (
+            self.brightness != 1.0
+            or self.contrast != 1.0
+            or self.blur > 0
+            or self.drop_cams
+        ):
             self._degrade_images(results)
         return results
 
@@ -85,5 +95,6 @@ class SensorDegradation:
         return (
             f"{self.__class__.__name__}(point_drop={self.point_drop}, "
             f"max_range={self.max_range}, brightness={self.brightness}, "
-            f"blur={self.blur}, drop_cams={self.drop_cams})"
+            f"contrast={self.contrast}, blur={self.blur}, "
+            f"drop_cams={self.drop_cams})"
         )

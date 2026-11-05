@@ -42,6 +42,30 @@ CONDITIONS = {
         ("front_back", {"drop_cams": ["CAM_FRONT", "CAM_BACK"]}),
         ("all", {"drop_cams": ALL_CAMS}),
     ],
+    # Both sensors degraded at once, approximating weather and hardware faults.
+    "combined": [
+        ("fog_light", {"contrast": 0.6, "blur": 2, "max_range": 40, "point_drop": 0.25}),
+        ("fog_heavy", {"contrast": 0.3, "blur": 5, "max_range": 25, "point_drop": 0.5}),
+        ("rain_light", {"brightness": 0.8, "blur": 2, "point_drop": 0.25}),
+        ("rain_heavy", {"brightness": 0.6, "blur": 5, "point_drop": 0.5, "max_range": 35}),
+        ("night_rain", {"brightness": 0.2, "blur": 3, "point_drop": 0.4}),
+        ("hw_failure", {"drop_cams": ["CAM_FRONT", "CAM_FRONT_LEFT"], "reduce_beams": 16}),
+    ],
+    # LiDAR stressors repeated with all cameras off; comparing against the
+    # matching lidar_* run (cameras on) shows how much the camera rescues.
+    "lidar_stress_no_cams": [
+        (name, dict(options, drop_cams=ALL_CAMS))
+        for name, options in [
+            ("drop0.75", {"point_drop": 0.75}),
+            ("drop0.9", {"point_drop": 0.9}),
+            ("beams16", {"reduce_beams": 16}),
+            ("beams4", {"reduce_beams": 4}),
+            ("beams1", {"reduce_beams": 1}),
+            ("sweeps0", {"sweeps_num": 0}),
+            ("range30m", {"max_range": 30}),
+            ("range20m", {"max_range": 20}),
+        ]
+    ],
 }
 
 CLASSES = [
@@ -87,9 +111,9 @@ def class_ap(metrics, name):
     return sum(metrics[k] for k in keys) / len(keys) if keys else float("nan")
 
 
-def write_summary(out_dir, groups):
+def write_summary(out_dir):
     rows = []
-    for group in groups:
+    for group in CONDITIONS:
         for name, options in CONDITIONS[group]:
             path = os.path.join(out_dir, f"{group}__{name}.json")
             if not os.path.exists(path):
@@ -140,7 +164,7 @@ def main():
                 print(f"skip {group}/{name} (done)")
                 continue
             run_condition(args.config, args.checkpoint, out_path, options)
-    write_summary(args.out_dir, groups)
+    write_summary(args.out_dir)
 
 
 if __name__ == "__main__":
