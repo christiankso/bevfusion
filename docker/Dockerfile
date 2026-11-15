@@ -26,3 +26,13 @@ RUN mv /opt/conda/compiler_compat/ld /opt/conda/compiler_compat/ld.bak && \
     mv /opt/conda/compiler_compat/ld.bak /opt/conda/compiler_compat/ld
 RUN pip install numba==0.48.0
 RUN pip install numpy==1.23.5
+
+# ROS 2 Foxy: the release for Ubuntu 20.04 / Python 3.8, so rclpy loads in the
+# same Python as BEVFusion. Run `source /opt/ros/foxy/setup.bash` before ros2/ scripts.
+RUN apt-get update && apt-get install -y curl gnupg lsb-release && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+      -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu focal main" \
+      > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && \
+    apt-get install -y ros-foxy-ros-base ros-foxy-vision-msgs
