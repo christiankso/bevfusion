@@ -12,15 +12,25 @@ Topics:
     /tf                            map -> base_link ego pose at every sensor timestamp
     /tf_static                     base_link -> <sensor> mounting (latched, per scene)
 
+Camera timing faults for stress tests:
+    --camera-clock-offset-ms D   camera stamps read D ms later than the true
+                                 capture time (unsynchronized clock); images are
+                                 also delivered D ms late, consistent with their stamp
+    --camera-delay-ms D          stamps correct, images delivered D ms late
+                                 (slow link or driver)
+
 Example (inside the container, after ``source /opt/ros/foxy/setup.bash``):
     python ros2/nuscenes_replay.py --dataroot data/nuscenes --split mini_val --rate 1
 """
 
 import argparse
+import array
+import bisect
 import time
 
 import numpy as np
 import rclpy
+from pyquaternion import Quaternion
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import TransformStamped
 from nuscenes.nuscenes import NuScenes
@@ -73,7 +83,9 @@ def make_pointcloud(points, stamp):
     msg.is_bigendian = False
     msg.point_step = 20
     msg.row_step = 20 * len(points)
-    msg.data = points.astype(np.float32).tobytes()
+    # array.array skips rclpy's per-byte range check, which is far too slow
+    # for ~700 KB clouds and would make the replay fall behind real time.
+    msg.data = array.array("B", points.astype(np.float32).tobytes())
     msg.is_dense = True
     return msg
 
@@ -96,11 +108,41 @@ def scene_events(nusc, scene):
     return events
 
 
+class PoseTimeline:
+    """Ego poses of a scene, interpolated at arbitrary timestamps."""
+
+    def __init__(self, nusc, events):
+        poses = {}
+        for timestamp, _, sd in events:
+            pose = nusc.get("ego_pose", sd["ego_pose_token"])
+            poses[timestamp] = (np.array(pose["translation"]), Quaternion(pose["rotation"]))
+        self.times = sorted(poses)
+        self.poses = [poses[t] for t in self.times]
+
+    def at(self, timestamp):
+        i = bisect.bisect_left(self.times, timestamp)
+        if i < len(self.times) and self.times[i] == timestamp:
+            translation, rotation = self.poses[i]
+        elif i == 0 or i == len(self.times):
+            translation, rotation = self.poses[min(i, len(self.times) - 1)]
+        else:
+            (t0, (p0, q0)), (t1, (p1, q1)) = (
+                (self.times[i - 1], self.poses[i - 1]),
+                (self.times[i], self.poses[i]),
+            )
+            a = (timestamp - t0) / (t1 - t0)
+            translation = p0 + a * (p1 - p0)
+            rotation = Quaternion.slerp(q0, q1, amount=a)
+        return translation, rotation.elements  # w, x, y, z
+
+
 class ReplayNode:
-    def __init__(self, node, nusc, rate):
+    def __init__(self, node, nusc, rate, camera_clock_offset_ms=0.0, camera_delay_ms=0.0):
         self.node = node
         self.nusc = nusc
         self.rate = rate
+        self.camera_offset_us = int(camera_clock_offset_ms * 1000)
+        self.camera_delay_us = int(camera_delay_ms * 1000)
         self.lidar_pub = node.create_publisher(PointCloud2, f"/{LIDAR}/points", 10)
         self.image_pubs = {
             cam: node.create_publisher(CompressedImage, f"/{cam}/image/compressed", 10)
@@ -135,19 +177,30 @@ class ReplayNode:
 
     def play_scene(self, scene):
         events = scene_events(self.nusc, scene)
-        self.publish_calibration(events, to_stamp(events[0][0]))
-        t0, wall0 = events[0][0], time.monotonic()
+        timeline = PoseTimeline(self.nusc, events)
+        # (publish time, stamp, channel, record); camera faults shift these.
+        schedule = []
         for timestamp, channel, sd in events:
-            delay = wall0 + (timestamp - t0) / 1e6 / self.rate - time.monotonic()
+            stamp_us, publish_us = timestamp, timestamp
+            if channel in CAMERAS:
+                stamp_us += self.camera_offset_us
+                publish_us = stamp_us + self.camera_delay_us
+            schedule.append((publish_us, stamp_us, channel, sd))
+        schedule.sort(key=lambda e: e[0])
+
+        self.publish_calibration(events, to_stamp(events[0][0]))
+        t0, wall0 = schedule[0][0], time.monotonic()
+        for publish_us, stamp_us, channel, sd in schedule:
+            delay = wall0 + (publish_us - t0) / 1e6 / self.rate - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
-            stamp = to_stamp(timestamp)
-            pose = self.nusc.get("ego_pose", sd["ego_pose_token"])
+            stamp = to_stamp(stamp_us)
+            # Pose at the stamp the message claims, which is what a receiver
+            # would look up (wrong if the camera clock is offset).
+            translation, rotation = timeline.at(stamp_us)
             self.tf_pub.publish(
                 TFMessage(
-                    transforms=[
-                        make_transform(stamp, "map", "base_link", pose["translation"], pose["rotation"])
-                    ]
+                    transforms=[make_transform(stamp, "map", "base_link", translation, rotation)]
                 )
             )
             path = f"{self.nusc.dataroot}/{sd['filename']}"
@@ -160,9 +213,9 @@ class ReplayNode:
                 msg.header.frame_id = channel
                 msg.format = "jpeg"
                 with open(path, "rb") as f:
-                    msg.data = f.read()
+                    msg.data = array.array("B", f.read())
                 self.image_pubs[channel].publish(msg)
-        return len(events), time.monotonic() - wall0
+        return len(schedule), time.monotonic() - wall0
 
 
 def main():
@@ -177,6 +230,8 @@ def main():
     parser.add_argument("--rate", type=float, default=1.0, help="playback speed; 2 = twice real time")
     parser.add_argument("--start-delay", type=float, default=3.0, help="seconds to wait for subscribers")
     parser.add_argument("--scene-gap", type=float, default=2.0, help="seconds of silence between scenes")
+    parser.add_argument("--camera-clock-offset-ms", type=float, default=0.0)
+    parser.add_argument("--camera-delay-ms", type=float, default=0.0)
     args = parser.parse_args()
 
     nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=False)
@@ -186,7 +241,9 @@ def main():
 
     rclpy.init()
     node = rclpy.create_node("nuscenes_replay")
-    replay = ReplayNode(node, nusc, args.rate)
+    replay = ReplayNode(
+        node, nusc, args.rate, args.camera_clock_offset_ms, args.camera_delay_ms
+    )
     time.sleep(args.start_delay)
     for scene in scenes:
         count, duration = replay.play_scene(scene)

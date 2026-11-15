@@ -10,10 +10,14 @@ default the worker always takes the newest LiDAR sweep and drops older
 unprocessed ones (real-time behaviour). ``--process-all`` queues every sweep
 instead, for checking accuracy against the offline evaluation.
 
+``--keyframes-only`` processes only the labeled keyframes (all sweeps are
+still buffered for merging), so accuracy can be measured at 1x speed.
+
 Output:
     /bevfusion/detections   vision_msgs/Detection3DArray (frame LIDAR_TOP)
-    --save-results          pickle with raw boxes (incl. velocity) and per-frame
-                            timing, scored by ros2/evaluate_ros_results.py
+    --save-results          pickle with raw boxes (incl. velocity), per-frame
+                            timing, LiDAR arrival times, and CPU/GPU/memory
+                            samples, scored by ros2/evaluate_ros_results.py
 
 Example (inside the container, after ``source /opt/ros/foxy/setup.bash``):
     python ros2/bevfusion_node.py --save-results results/ros/run.pkl
@@ -27,7 +31,9 @@ import sys
 import threading
 import time
 
+import mmcv
 import numpy as np
+import psutil
 import rclpy
 import torch
 from mmcv import Config
@@ -103,9 +109,15 @@ class BEVFusionNode:
         self.intrinsics = {}  # camera -> 3x3
         self.last_lidar_stamp = None
         self.last_lidar_wall = None
+        self.arrivals = {}  # stamp_us -> wall time every LiDAR sweep arrived
         self.records = []
+        self.monitor_samples = []
         self.stats = collections.Counter()
         self.stop = threading.Event()
+        self.keyframes = None
+        if args.keyframes_only:
+            infos = mmcv.load(args.infos)["infos"]
+            self.keyframes = {info["timestamp"] for info in infos}
 
         node.create_subscription(PointCloud2, f"/{LIDAR}/points", self.on_lidar, 10)
         for cam in CAMERAS:
@@ -126,6 +138,7 @@ class BEVFusionNode:
         self.det_pub = node.create_publisher(Detection3DArray, "/bevfusion/detections", 10)
         self.worker = threading.Thread(target=self.run_worker, daemon=True)
         self.worker.start()
+        threading.Thread(target=self.run_monitor, daemon=True).start()
         self.log.info("BEVFusion node ready")
 
     # ------------------------------------------------------------------ model
@@ -163,7 +176,9 @@ class BEVFusionNode:
             ):
                 self.history.clear()  # new scene or time jump
             self.last_lidar_stamp, self.last_lidar_wall = t, wall
-            self.pending.append((t, points, wall))
+            self.arrivals[t] = wall
+            if self.keyframes is None or t in self.keyframes:
+                self.pending.append((t, points, wall))
             self.history.append((t, points))
             self.stats["received"] += 1
 
@@ -228,7 +243,8 @@ class BEVFusionNode:
         with self.lock:
             ego2global = self.poses.get(t)
             cam_poses = {cam: self.poses.get(ts) for cam, (ts, _) in matched.items()}
-            sweeps = [(ts, p) for ts, p in self.history if ts < t][-self.args.sweeps :]
+            previous = [(ts, p) for ts, p in self.history if ts < t]
+            sweeps = previous[-self.args.sweeps :] if self.args.sweeps > 0 else []
             sweep_poses = [self.poses.get(ts) for ts, _ in sweeps]
             lidar2ego = self.sensor2ego.get(LIDAR)
             cam2ego = {cam: self.sensor2ego.get(cam) for cam in CAMERAS}
@@ -291,7 +307,7 @@ class BEVFusionNode:
             data["camera2ego"].append(cam2ego[cam])
         size = data["img"][0].size
         data.update(ori_shape=size, img_shape=size, pad_shape=size, scale_factor=1.0)
-        return collate([self.pipeline(data)], samples_per_gpu=1)
+        return collate([self.pipeline(data)], samples_per_gpu=1), ego2global, lidar2ego
 
     def publish(self, t, boxes, scores, labels):
         msg = Detection3DArray()
@@ -339,10 +355,16 @@ class BEVFusionNode:
             if matched is None:
                 self.stats["skipped_no_sync"] += 1
                 continue
-            batch = self.build_input(t, points, matched)
-            if batch is None:
+            # Poses and calibration travel on other topics and can arrive a
+            # few ms after the LiDAR sweep; wait for them up to the sync deadline.
+            built = self.build_input(t, points, matched)
+            while built is None and time.monotonic() < received + self.args.sync_timeout:
+                time.sleep(0.002)
+                built = self.build_input(t, points, matched)
+            if built is None:
                 self.stats["skipped_no_calibration"] += 1
                 continue
+            batch, ego2global, lidar2ego = built
             prepared = time.monotonic()
             with torch.no_grad():
                 result = self.model(return_loss=False, rescale=True, **batch)[0]
@@ -366,6 +388,27 @@ class BEVFusionNode:
                     inference_ms=(inferred - prepared) * 1000,
                     publish_ms=(published - inferred) * 1000,
                     latency_ms=(published - received) * 1000,
+                    received_wall=received,
+                    published_wall=published,
+                    ego2global=ego2global,
+                    lidar2ego=lidar2ego,
+                )
+            )
+
+    def run_monitor(self):
+        """Sample this process's CPU and memory every interval. GPU utilization
+        is logged by a separate nvidia-smi process (see run_timing_stress.sh),
+        because launching it from this large process slows inference."""
+        process = psutil.Process()
+        process.cpu_percent()
+        while not self.stop.wait(self.args.monitor_interval):
+            self.monitor_samples.append(
+                dict(
+                    wall=time.monotonic(),
+                    cpu_percent=process.cpu_percent(),  # 100 = one full core
+                    rss_mb=process.memory_info().rss / 2**20,
+                    torch_gpu_mb=torch.cuda.memory_allocated() / 2**20,
+                    torch_gpu_peak_mb=torch.cuda.max_memory_allocated() / 2**20,
                 )
             )
 
@@ -377,7 +420,14 @@ class BEVFusionNode:
         os.makedirs(os.path.dirname(self.args.save_results) or ".", exist_ok=True)
         with open(self.args.save_results, "wb") as f:
             pickle.dump(
-                dict(args=vars(self.args), stats=dict(self.stats), records=self.records), f
+                dict(
+                    args=vars(self.args),
+                    stats=dict(self.stats),
+                    records=self.records,
+                    arrivals=self.arrivals,
+                    monitor=self.monitor_samples,
+                ),
+                f,
             )
         self.log.info(f"saved {len(self.records)} frames to {self.args.save_results}")
 
@@ -393,6 +443,9 @@ def main():
     parser.add_argument("--checkpoint", default="pretrained/bevfusion-det.pth")
     parser.add_argument("--sweeps", type=int, default=9, help="previous LiDAR sweeps to merge")
     parser.add_argument("--process-all", action="store_true", help="queue every sweep, never drop")
+    parser.add_argument("--keyframes-only", action="store_true", help="process only labeled keyframes")
+    parser.add_argument("--infos", default="data/nuscenes/nuscenes_infos_val.pkl", help="keyframe list for --keyframes-only")
+    parser.add_argument("--monitor-interval", type=float, default=0.5, help="seconds between CPU/GPU samples")
     parser.add_argument("--sync-timeout", type=float, default=0.2, help="max wall seconds to wait for cameras")
     parser.add_argument("--sync-tolerance-ms", type=float, default=100, help="max camera-LiDAR stamp gap")
     parser.add_argument("--publish-score-thr", type=float, default=0.1)
