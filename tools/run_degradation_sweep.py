@@ -91,7 +91,7 @@ def degrade_args(options):
     return args
 
 
-def run_condition(config, checkpoint, out_path, options):
+def run_condition(config, checkpoint, out_path, options, jsonfile_prefix=None):
     cmd = [
         "torchpack", "dist-run", "-np", "1",
         "python", "tools/test.py", config, checkpoint,
@@ -100,6 +100,10 @@ def run_condition(config, checkpoint, out_path, options):
     ]
     if options:
         cmd += ["--degrade"] + degrade_args(options)
+    if jsonfile_prefix:
+        # Keep the nuScenes submission (results_nusc.json) and the official
+        # metrics_summary.json / metrics_details.json in this folder.
+        cmd += ["--eval-options", f"jsonfile_prefix={jsonfile_prefix}"]
     log_path = out_path[: -len(".json")] + ".log"
     print(" ".join(cmd), flush=True)
     with open(log_path, "w") as log:
@@ -153,6 +157,12 @@ def main():
         choices=list(CONDITIONS),
         help="condition groups to run (default: all)",
     )
+    parser.add_argument(
+        "--save-nusc-json",
+        action="store_true",
+        help="also keep results_nusc.json and the official metrics files in "
+        "<out-dir>/nusc/<group>__<name>/ (reruns conditions that lack them)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -160,10 +170,16 @@ def main():
     for group in groups:
         for name, options in CONDITIONS[group]:
             out_path = os.path.join(args.out_dir, f"{group}__{name}.json")
-            if os.path.exists(out_path):
+            prefix = None
+            if args.save_nusc_json:
+                prefix = os.path.join(args.out_dir, "nusc", f"{group}__{name}")
+            done = os.path.exists(out_path) and (
+                prefix is None or os.path.exists(os.path.join(prefix, "results_nusc.json"))
+            )
+            if done:
                 print(f"skip {group}/{name} (done)")
                 continue
-            run_condition(args.config, args.checkpoint, out_path, options)
+            run_condition(args.config, args.checkpoint, out_path, options, prefix)
     write_summary(args.out_dir)
 
 

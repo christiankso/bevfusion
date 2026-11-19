@@ -50,7 +50,7 @@ for run in "${RUNS[@]}"; do
   kill $smi_pid
   wait $node_pid
   python ros2/evaluate_ros_results.py "$OUT/$name.pkl" --out "$OUT/$name.json" \
-    --gpu-log "$OUT/$name.gpu.csv" > "$OUT/$name.eval.log" 2>&1 \
+    --gpu-log "$OUT/$name.gpu.csv" --jsonfile-prefix "$OUT/nusc/$name" > "$OUT/$name.eval.log" 2>&1 \
     || { echo "evaluation failed for $name"; tail -5 "$OUT/$name.eval.log"; }
   grep -h "stats" "$OUT/$name.node.log"
 done

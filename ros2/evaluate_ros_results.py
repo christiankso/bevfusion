@@ -90,10 +90,14 @@ def record_output(record, tensor=None):
     )
 
 
-def evaluate(dataset, outputs, eval_kwargs):
+def evaluate(dataset, outputs, eval_kwargs, jsonfile_prefix=None):
+    """Official nuScenes metrics; with jsonfile_prefix, keep results_nusc.json
+    and metrics_summary.json / metrics_details.json in that folder."""
     if all(len(o["scores_3d"]) == 0 for o in outputs):
         return 0.0, 0.0, {}  # nuScenes eval cannot score an empty submission
-    metrics = dataset.evaluate(outputs, metric="bbox", **eval_kwargs)
+    metrics = dataset.evaluate(
+        outputs, metric="bbox", jsonfile_prefix=jsonfile_prefix, **eval_kwargs
+    )
     return metrics["object/map"], metrics["object/nds"], metrics
 
 
@@ -103,6 +107,11 @@ def main():
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--out", help="write metrics and timing summary to this json file")
     parser.add_argument("--gpu-log", help="nvidia-smi csv (utilization %%, memory MB) sampled during the run")
+    parser.add_argument(
+        "--jsonfile-prefix",
+        help="folder for nuScenes results_nusc.json + official metrics files, one "
+        "subfolder per measure: keyframes/, realtime/, realtime_extrapolated/",
+    )
     args = parser.parse_args()
 
     with open(args.results, "rb") as f:
@@ -125,7 +134,10 @@ def main():
         for i in infos
     ]
     processed = sum(i["timestamp"] in by_stamp for i in infos)
-    mAP, NDS, metrics = evaluate(dataset, outputs, eval_kwargs)
+    def prefix(name):
+        return f"{args.jsonfile_prefix}/{name}" if args.jsonfile_prefix else None
+
+    mAP, NDS, metrics = evaluate(dataset, outputs, eval_kwargs, prefix("keyframes"))
     summary = dict(
         results=args.results,
         node_args=run["args"],
@@ -166,8 +178,10 @@ def main():
             tensor = torch.from_numpy(record["boxes"])
             realtime.append(record_output(record, move_boxes(tensor, source2keyframe)))
             extrapolated.append(record_output(record, move_boxes(tensor, source2keyframe, dt)))
-        rt_map, rt_nds, _ = evaluate(dataset, realtime, eval_kwargs)
-        ex_map, ex_nds, _ = evaluate(dataset, extrapolated, eval_kwargs)
+        rt_map, rt_nds, _ = evaluate(dataset, realtime, eval_kwargs, prefix("realtime"))
+        ex_map, ex_nds, _ = evaluate(
+            dataset, extrapolated, eval_kwargs, prefix("realtime_extrapolated")
+        )
         summary.update(
             realtime_mAP=rt_map,
             realtime_NDS=rt_nds,
